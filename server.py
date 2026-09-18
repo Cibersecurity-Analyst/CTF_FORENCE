@@ -33,7 +33,7 @@ class CTFOfflineHandler(SimpleHTTPRequestHandler):
 
     def do_GET(self):
         parsed = urllib.parse.urlparse(self.path)
-        path = parsed.path
+        path = urllib.parse.unquote(parsed.path)  # decodifica %20, %C3%AD, etc.
 
         if path in ("", "/", "/index.html"):
             self.send_response(302)
@@ -52,7 +52,6 @@ class CTFOfflineHandler(SimpleHTTPRequestHandler):
         if path == "/api/v1/challenges":
             challenges = load_json(CHALLENGES_FILE, [])
             solves = set(load_json(SOLVES_FILE, []))
-
             summary = []
             for ch in challenges:
                 cid = ch["id"]
@@ -67,12 +66,9 @@ class CTFOfflineHandler(SimpleHTTPRequestHandler):
                         "solved_by_me": is_solved,
                         "category": ch["category"],
                         "tags": ch.get("tags", []),
-                        # Se eliminaron "template" y "script" para evitar 404
                     }
                 )
-
-            response_data = {"success": True, "data": summary}
-            self.send_json(response_data)
+            self.send_json({"success": True, "data": summary})
             return
 
         if path.startswith("/api/v1/challenges/"):
@@ -81,14 +77,11 @@ class CTFOfflineHandler(SimpleHTTPRequestHandler):
                 cid = int(cid_str)
             except ValueError:
                 cid = -1
-
             challenges = load_json(CHALLENGES_FILE, [])
             solves = set(load_json(SOLVES_FILE, []))
-
             found = next((ch for ch in challenges if ch["id"] == cid), None)
             if found:
                 detail = dict(found)
-                # Eliminar posibles campos que causan peticiones a archivos inexistentes
                 detail.pop("template", None)
                 detail.pop("script", None)
                 detail["solved_by_me"] = cid in solves
@@ -113,27 +106,62 @@ class CTFOfflineHandler(SimpleHTTPRequestHandler):
             self.send_json({"success": True, "data": []})
             return
 
-        # Ruta para Server-Sent Events (evita 404)
         if path == "/events":
             self.send_response(204)
             self.end_headers()
             return
 
-        # Fallback to standard static file serving (CSS, JS, fonts, files)
+        # === DESCARGA FORZADA DE ARCHIVOS ===
+        if path.startswith("/files/"):
+            self.serve_download(path)
+            return
+
+        # Fallback a archivos estáticos
         super().do_GET()
+
+    def serve_download(self, path):
+        """Sirve archivos de /files/ forzando la descarga."""
+        # Convierte /files/hash/nombre.ext en files/hash/nombre.ext
+        relative = path.lstrip("/")
+        # Normaliza la ruta y evita escapes fuera de BASE_DIR
+        full_path = os.path.normpath(os.path.join(BASE_DIR, relative))
+        if not full_path.startswith(BASE_DIR):
+            self.send_error(403, "Acceso denegado")
+            return
+
+        if not os.path.isfile(full_path):
+            self.send_error(404, "Archivo no encontrado")
+            return
+
+        filename = os.path.basename(full_path)
+        mime_type, _ = mimetypes.guess_type(full_path)
+        if mime_type is None:
+            mime_type = "application/octet-stream"
+
+        try:
+            with open(full_path, "rb") as f:
+                content = f.read()
+        except Exception as e:
+            self.send_error(500, f"Error al leer archivo: {e}")
+            return
+
+        self.send_response(200)
+        self.send_header("Content-Type", mime_type)
+        self.send_header("Content-Length", str(len(content)))
+        # Fuerza la descarga con el nombre original
+        self.send_header("Content-Disposition", f'attachment; filename="{filename}"')
+        self.send_header("Access-Control-Allow-Origin", "*")
+        self.end_headers()
+        self.wfile.write(content)
 
     def do_HEAD(self):
         parsed = urllib.parse.urlparse(self.path)
         path = parsed.path
-
-        # Para cualquier endpoint de la API, respondemos 200 sin cuerpo
         if path.startswith("/api/"):
             self.send_response(200)
             self.send_header("Content-Type", "application/json; charset=utf-8")
             self.end_headers()
             return
-
-        # Para archivos estáticos, delegamos al comportamiento normal
         super().do_HEAD()
 
     def do_POST(self):
